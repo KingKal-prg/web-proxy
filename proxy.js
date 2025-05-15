@@ -1,49 +1,90 @@
 const express = require('express');
-const { createProxyMiddleware } = require('http-proxy-middleware');
-const { Buffer } = require('buffer');
-
+const fetch = require('node-fetch');
+const cheerio = require('cheerio');
 const app = express();
 
-app.use('/proxy', (req, res, next) => {
-  const targetUrl = req.query.url;
-  if (!targetUrl) return res.status(400).send('Missing url param');
+const PORT = process.env.PORT || 3000;
 
-  const proxy = createProxyMiddleware({
-    target: targetUrl,
-    changeOrigin: true,
-    selfHandleResponse: true, // so we can modify response
-    onProxyRes: async (proxyRes, req, res) => {
-      let body = Buffer.from([]);
-      proxyRes.on('data', chunk => body = Buffer.concat([body, chunk]));
-      proxyRes.on('end', () => {
-        const contentType = proxyRes.headers['content-type'] || '';
-        let responseBody = body.toString('utf8');
+// Helper function to rewrite URLs inside HTML
+function rewriteHtml(html, baseProxyUrl) {
+  const $ = cheerio.load(html);
 
-        if (contentType.includes('text/html')) {
-          // Rewrite URLs in HTML here:
-          // For example, replace all href="https://www.youtube.com" 
-          // with href="/proxy?url=https%3A%2F%2Fwww.youtube.com"
-          responseBody = responseBody.replace(/href="(https?:\/\/[^"]+)"/g, (match, url) => {
-            const proxiedUrl = `/proxy?url=${encodeURIComponent(url)}`;
-            return `href="${proxiedUrl}"`;
-          });
-          // Similarly for src, action, etc.
-        }
+  // Rewrite href links
+  $('a[href]').each((i, el) => {
+    const href = $(el).attr('href');
+    if (!href) return;
 
-        // Remove iframe-blocking headers:
-        delete proxyRes.headers['x-frame-options'];
-        delete proxyRes.headers['content-security-policy'];
+    // Ignore anchors, javascript links, mailto
+    if (href.startsWith('#') || href.startsWith('javascript:') || href.startsWith('mailto:')) return;
 
-        // Set headers for the proxied response
-        Object.entries(proxyRes.headers).forEach(([key, value]) => {
-          res.setHeader(key, value);
-        });
-
-        res.status(proxyRes.statusCode).send(responseBody);
-      });
+    // Rewrite absolute or relative URLs to route via proxy
+    let newUrl;
+    if (href.startsWith('http')) {
+      newUrl = `${baseProxyUrl}?url=${encodeURIComponent(href)}`;
+    } else if (href.startsWith('/')) {
+      // Relative to domain root
+      // Extract domain from baseProxyUrl param to build full URL
+      const baseUrl = new URL(baseProxyUrl);
+      newUrl = `${baseProxyUrl}?url=${encodeURIComponent(baseUrl.origin + href)}`;
+    } else {
+      // Relative URL (e.g. ./page.html)
+      newUrl = `${baseProxyUrl}?url=${encodeURIComponent(href)}`;
     }
+    $(el).attr('href', newUrl);
   });
-  proxy(req, res, next);
+
+  // Rewrite src attributes (images, scripts, etc.) similarly if needed
+  // For many sites you can skip this or selectively rewrite resources
+
+  return $.html();
+}
+
+app.get('/', async (req, res) => {
+  const targetUrl = req.query.url;
+
+  if (!targetUrl) {
+    // Show basic HTML search form if no url param
+    res.send(`
+      <form method="get" action="/">
+        <input name="url" placeholder="Enter a URL (e.g. youtube.com)" style="width: 300px" />
+        <button type="submit">Go</button>
+      </form>
+    `);
+    return;
+  }
+
+  try {
+    // Add http:// if missing for fetch to work
+    let fetchUrl = targetUrl;
+    if (!/^https?:\/\//i.test(fetchUrl)) {
+      fetchUrl = 'http://' + fetchUrl;
+    }
+
+    const response = await fetch(fetchUrl);
+    const contentType = response.headers.get('content-type');
+
+    let body = await response.text();
+
+    if (contentType && contentType.includes('text/html')) {
+      // Rewrite HTML links to route via proxy
+      const baseProxyUrl = `${req.protocol}://${req.get('host')}${req.path}`;
+      body = rewriteHtml(body, baseProxyUrl);
+    }
+
+    // Remove frame blocking headers if any
+    res.set('X-Frame-Options', 'ALLOWALL');
+    res.set('Content-Security-Policy', "frame-ancestors *");
+
+    // Forward other headers you want or set your own
+    res.set('Content-Type', contentType);
+
+    res.send(body);
+  } catch (err) {
+    res.status(500).send('Error fetching the page.');
+    console.error(err);
+  }
 });
 
-app.listen(3000, () => console.log('Proxy running on http://localhost:3000'));
+app.listen(PORT, () => {
+  console.log(`Proxy server listening at http://localhost:${PORT}`);
+});
